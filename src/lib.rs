@@ -259,6 +259,13 @@ impl<T: ?Sized> DynStack<T> {
         Some(out)
     }
 
+    /// Retrieve a trait object reference at the provided index.
+    pub fn get_unchecked<'a>(&'a self, index: usize) -> &'a T {
+        let item = unsafe { self.offs_table.get_unchecked(index) };
+        let components = [self.dyn_data as usize + item.0, item.1];
+        unsafe { &*fatptr::recomp(components) }
+    }
+
     /// Retrieve a mutable trait object reference at the provided index.
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<&'a mut T> {
         let item = self.offs_table.get(index)?;
