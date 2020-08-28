@@ -5,7 +5,7 @@
 //! ```
 //! # use dynstack::{DynStack, dyn_push};
 //! # use std::fmt::Debug;
-//! let mut stack = DynStack::<dyn Debug>::new();
+//! let mut stack = DynStack::<dyn Debug>::with_capacity(3);
 //! dyn_push!(stack, "hello, world!");
 //! dyn_push!(stack, 0usize);
 //! dyn_push!(stack, [1, 2, 3, 4, 5, 6]);
@@ -127,68 +127,16 @@ impl<T: ?Sized> DynStack<T> {
         Self::make_layout(self.dyn_cap)
     }
 
-    /// Creates a new, empty, [`DynStack`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `T` is not a trait object.
-    pub fn new() -> Self {
-        assert_eq!(
-            mem::size_of::<*const T>(),
-            mem::size_of::<[usize; 2]>(),
-            "Used on non trait object!"
-        );
-        // SAFETY: We verify above that T is indeed a trait object.
-        unsafe { Self::new_unchecked() }
-    }
-
-    /// Creates a new, empty, [`DynStack`]. This method is a `const fn`, so instances can be
-    /// statically initialized. This comes at the cost of no runtime sanity check that the stack
-    /// is properly used with trait objects, which is why it is unsafe to call.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called with the generic, `T`, being a trait object.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use core::fmt::Display;
-    /// # use dynstack::DynStack;
-    ///
-    /// // SAFETY: Storing trait objects, as required
-    /// static CORRECT: DynStack<dyn Display + Sync> = unsafe { DynStack::new_unchecked() };
-    ///
-    /// // DONT do the following, Sting is not a trait object. This compiles
-    /// // but has undefined behavior.
-    /// static WRONG: DynStack<String> = unsafe { DynStack::new_unchecked() };
-    /// ```
-    ///
-    /// Storing it directly in a static, like above, does of course not make much sense, because
-    /// you can't modify it. But if you put it inside a synchronazation primitive that allows
-    /// static initialization, such as `parking_lot::RwLock`, it can be used as a globally
-    /// accessible, modifiable stack.
     #[inline]
-    pub const unsafe fn new_unchecked() -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            offs_table: Vec::new(),
-            dyn_data: ptr::null_mut(),
+            offs_table: Vec::with_capacity(capacity),
+            dyn_data: unsafe { alloc(Self::make_layout(capacity)) },
             dyn_size: 0,
-            dyn_cap: 0,
+            dyn_cap: capacity,
             max_align: 16,
             _spooky: PhantomData,
         }
-    }
-
-    /// Called on first push to allocate heap data.
-    /// `DynStack::new` does not perform any allocation,
-    /// since it makes creating `DynStack` instances a lot faster.
-    fn allocate(&mut self, item_size: usize) {
-        // Always allocate a power of two size, fitting the first item.
-        // At least 16 bytes.
-        let alloc_size = item_size.next_power_of_two().max(16);
-        self.dyn_cap = alloc_size;
-        self.dyn_data = unsafe { alloc(Self::make_layout(alloc_size)) };
     }
 
     #[cfg(test)]
@@ -219,6 +167,7 @@ impl<T: ?Sized> DynStack<T> {
 
         let new_cap = self.dyn_cap * 2;
         self.reallocate(new_cap);
+        self.offs_table.reserve_exact(self.dyn_cap);
 
         let new_align = self.dyn_data as usize & align_mask;
         let mut align_diff = (new_align as isize) - (prev_align as isize);
@@ -261,10 +210,7 @@ impl<T: ?Sized> DynStack<T> {
         let size = mem::size_of_val(&*item);
         let align = mem::align_of_val(&*item);
 
-        // If we have not yet allocated any data, start by doing so.
-        if self.dyn_data.is_null() {
-            self.allocate(size);
-        }
+        debug_assert!(!self.dyn_data.is_null());
 
         let align_offs = loop {
             let curr_ptr = self.dyn_data as usize + self.dyn_size;
@@ -284,8 +230,9 @@ impl<T: ?Sized> DynStack<T> {
             .copy_from_nonoverlapping(item as *const u8, size);
 
         let ptr_components = fatptr::decomp(item);
-        self.offs_table
-            .push((self.dyn_size + align_offs, ptr_components[1]));
+        debug_assert!(self.offs_table.len() + 1 <= self.offs_table.capacity());
+        ptr::write(self.offs_table.as_mut_ptr().add(self.offs_table.len()), (self.dyn_size + align_offs, ptr_components[1]));
+        self.offs_table.set_len(self.offs_table.len() + 1);
 
         self.dyn_size += align_offs + size;
         self.max_align = align.max(self.max_align);
@@ -409,7 +356,7 @@ macro_rules! dyn_push {
 #[test]
 fn test_push_pop() {
     use std::fmt::Debug;
-    let mut stack = DynStack::<dyn Debug>::new();
+    let mut stack = DynStack::<dyn Debug>::with_capacity(10);
     let bunch = vec![1u32, 2, 3, 4, 5, 6, 7, 8, 9];
     dyn_push!(stack, 1u8);
     dyn_push!(stack, 1u32);
@@ -453,7 +400,7 @@ fn test_push_pop() {
 
 #[test]
 fn test_fn() {
-    let mut stack = DynStack::<dyn Fn() -> usize>::new();
+    let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(100);
     for i in 0..100 {
         dyn_push!(stack, move || i);
     }
@@ -489,7 +436,7 @@ fn test_drop() {
     }
 
     {
-        let mut stack = DynStack::<dyn Any>::new();
+        let mut stack = DynStack::<dyn Any>::with_capacity(10);
         dyn_push!(stack, Droppable { counter: 1 });
         dyn_push!(stack, Droppable { counter: 2 });
         dyn_push!(stack, Droppable { counter: 3 });
@@ -564,7 +511,7 @@ fn test_align() {
         assert!(thin_ptr & (item.alignment() - 1) == 0);
     };
 
-    let mut stack = DynStack::<dyn Aligned>::new();
+    let mut stack = DynStack::<dyn Aligned>::with_capacity(256);
 
     dyn_push!(stack, new32());
     dyn_push!(stack, new64());
@@ -584,16 +531,10 @@ fn test_align() {
 }
 
 #[test]
-#[should_panic]
-fn test_non_dyn() {
-    let _stack: DynStack<u8> = DynStack::new();
-}
-
-#[test]
 fn test_send() {
     use std::{fmt::Display, sync::mpsc, thread};
 
-    let mut stack: DynStack<dyn Display + Send> = DynStack::new();
+    let mut stack: DynStack<dyn Display + Send> = DynStack::with_capacity(1);
     dyn_push!(stack, String::from("1"));
 
     let (sender, receiver) = mpsc::channel();
@@ -644,7 +585,7 @@ fn test_sync() {
     // Create a stack with different type of atomic integers in it.
     // We use quite a lot of integers, so the thread execution later
     // is likely to interleave.
-    let mut stack: DynStack<dyn AtomicInt> = DynStack::new();
+    let mut stack: DynStack<dyn AtomicInt> = DynStack::with_capacity(10000);
     for i in 0..10_000 {
         if i % 2 == 0 {
             dyn_push!(stack, AtomicI32::new(0));
@@ -675,7 +616,7 @@ fn test_sync() {
 
 #[test]
 fn test_iter_size_hint() {
-    let mut stack = DynStack::<dyn Fn() -> usize>::new();
+    let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(1);
     {
         let (min, max) = stack.iter().size_hint();
         assert_eq!(min, 0);

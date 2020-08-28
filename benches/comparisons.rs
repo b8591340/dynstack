@@ -15,16 +15,16 @@ impl Large {
 impl ATrait for Large {}
 
 fn new_speed_naive(b: &mut Bencher) {
-    b.iter(Vec::<Box<dyn Display>>::new);
+    b.iter(|| Vec::<Box<dyn Display>>::with_capacity(1 << 10));
 }
 
 fn new_speed_dynstack(b: &mut Bencher) {
-    b.iter(DynStack::<dyn Display>::new);
+    b.iter(|| DynStack::<dyn Display>::with_capacity(1 << 10));
 }
 
 fn push_large_speed_naive(b: &mut Bencher) {
     b.iter(|| {
-        let mut vec = Vec::<Box<dyn ATrait>>::new();
+        let mut vec = Vec::<Box<dyn ATrait>>::with_capacity(1);
         vec.push(Box::new(Large::new()));
         vec
     });
@@ -32,14 +32,14 @@ fn push_large_speed_naive(b: &mut Bencher) {
 
 fn push_large_speed_dynstack(b: &mut Bencher) {
     b.iter(|| {
-        let mut stack = DynStack::<dyn ATrait>::new();
+        let mut stack = DynStack::<dyn ATrait>::with_capacity(1);
         dyn_push!(stack, Large::new());
         stack
     });
 }
 
 fn push_speed_naive(b: &mut Bencher) {
-    let mut vec = Vec::<Box<dyn Display>>::new();
+    let mut vec = Vec::<Box<dyn Display>>::with_capacity(4);
     b.iter(|| {
         vec.push(Box::new(0xF00BAAusize));
         vec.push(Box::new(0xABBAu16));
@@ -49,7 +49,7 @@ fn push_speed_naive(b: &mut Bencher) {
 }
 
 fn push_speed_dynstack(b: &mut Bencher) {
-    let mut stack = DynStack::<dyn Display>::new();
+    let mut stack = DynStack::<dyn Display>::with_capacity(4);
     b.iter(|| {
         dyn_push!(stack, 0xF00BAAusize);
         dyn_push!(stack, 0xABBAu16);
@@ -60,7 +60,7 @@ fn push_speed_dynstack(b: &mut Bencher) {
 
 fn push_and_run_naive(b: &mut Bencher) {
     b.iter(|| {
-        let mut stack = Vec::<Box<dyn Fn() -> usize>>::new();
+        let mut stack = Vec::<Box<dyn Fn() -> usize>>::with_capacity(1 << 10);
         fn pseudorecursive(stack: &mut Vec<Box<dyn Fn() -> usize>>, n: usize) {
             stack.push(Box::new(move || n - 1));
         }
@@ -77,7 +77,7 @@ fn push_and_run_naive(b: &mut Bencher) {
 
 fn push_and_run_dynstack(b: &mut Bencher) {
     b.iter(|| {
-        let mut stack = DynStack::<dyn Fn() -> usize>::new();
+        let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(1 << 10);
         fn pseudorecursive(stack: &mut DynStack<dyn Fn() -> usize>, n: usize) {
             dyn_push!(stack, move || n - 1);
         }
@@ -109,7 +109,7 @@ fn pseudorecursive2_naive(b: &mut Bencher) {
 
 fn pseudorecursive2_dynstack(b: &mut Bencher) {
     b.iter(|| {
-        let mut stack = DynStack::<dyn Fn() -> usize>::new();
+        let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(1 << 10);
         fn pseudorecursive(stack: &mut DynStack<dyn Fn() -> usize>, n: usize) {
             dyn_push!(stack, move || n - 1);
         }
@@ -134,7 +134,7 @@ impl AsUsize for usize {
 }
 
 fn access_naive(b: &mut Bencher) {
-    let mut stack = Vec::<Box<dyn AsUsize>>::new();
+    let mut stack = Vec::<Box<dyn AsUsize>>::with_capacity(1000);
     for _ in 0..1000 {
         stack.push(Box::new(0xF00BAAusize));
     }
@@ -146,7 +146,7 @@ fn access_naive(b: &mut Bencher) {
 }
 
 fn access_dynstack(b: &mut Bencher) {
-    let mut stack = DynStack::<dyn AsUsize>::new();
+    let mut stack = DynStack::<dyn AsUsize>::with_capacity(1000);
     for _ in 0..1000 {
         dyn_push!(stack, 0xF00BAAusize);
     }
