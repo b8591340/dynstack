@@ -5,7 +5,7 @@
 //! ```
 //! # use dynstack::{DynStack, dyn_push};
 //! # use std::fmt::Debug;
-//! let mut stack = DynStack::<dyn Debug>::with_capacity(3);
+//! let mut stack = DynStack::<dyn Debug>::with_elements_capacity(3, 1 << 8);
 //! dyn_push!(stack, "hello, world!");
 //! dyn_push!(stack, 0usize);
 //! dyn_push!(stack, [1, 2, 3, 4, 5, 6]);
@@ -39,6 +39,7 @@ use core::{
 mod fatptr;
 
 /// Rounds up an integer to the nearest `align`
+#[inline(always)]
 fn align_up(num: usize, align: usize) -> usize {
     let align_bits = align.trailing_zeros();
     (num + align - 1) >> align_bits << align_bits
@@ -120,15 +121,18 @@ unsafe impl<T: ?Sized + Send> Send for DynStack<T> {}
 unsafe impl<T: ?Sized + Sync> Sync for DynStack<T> {}
 
 impl<T: ?Sized> DynStack<T> {
+    #[inline(always)]
     fn make_layout(cap: usize) -> Layout {
         unsafe { Layout::from_size_align_unchecked(cap, 16) }
     }
+
+    #[inline(always)]
     fn layout(&self) -> Layout {
         Self::make_layout(self.dyn_cap)
     }
 
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             offs_table: Vec::with_capacity(capacity),
             dyn_data: unsafe { alloc(Self::make_layout(capacity)) },
@@ -139,21 +143,19 @@ impl<T: ?Sized> DynStack<T> {
         }
     }
 
-    #[cfg(test)]
-    fn reallocate(&mut self, new_cap: usize) {
-        let old_layout = self.layout();
-        self.dyn_cap = new_cap;
-        unsafe {
-            // The point of this is to maximize the chances of having changed alignment
-            // characteristics, for testing purposes.
-            let new_data = alloc(self.layout());
-            ptr::copy_nonoverlapping(self.dyn_data, new_data, self.dyn_size);
-            dealloc(self.dyn_data, old_layout);
-            self.dyn_data = new_data;
+    #[inline(always)]
+    pub fn with_elements_capacity(elements: usize, capacity: usize) -> Self {
+        Self {
+            offs_table: Vec::with_capacity(elements),
+            dyn_data: unsafe { alloc(Self::make_layout(capacity)) },
+            dyn_size: 0,
+            dyn_cap: capacity,
+            max_align: 16,
+            _spooky: PhantomData,
         }
     }
 
-    #[cfg(not(test))]
+    #[inline(always)]
     fn reallocate(&mut self, new_cap: usize) {
         use alloc::alloc::realloc;
         self.dyn_cap = new_cap;
@@ -161,13 +163,14 @@ impl<T: ?Sized> DynStack<T> {
     }
 
     /// Double the stack's capacity
-    fn grow(&mut self) {
+    #[inline(always)]
+    pub fn reserve_exact(&mut self, elements: usize, additional: usize) {
         let align_mask = self.max_align - 1;
         let prev_align = self.dyn_data as usize & align_mask;
 
-        let new_cap = self.dyn_cap * 2;
-        self.reallocate(new_cap);
-        self.offs_table.reserve_exact(self.dyn_cap);
+        debug_assert!(additional > self.dyn_cap - self.dyn_size);
+        self.reallocate(self.dyn_cap + additional);
+        self.offs_table.reserve_exact(elements);
 
         let new_align = self.dyn_data as usize & align_mask;
         let mut align_diff = (new_align as isize) - (prev_align as isize);
@@ -206,23 +209,16 @@ impl<T: ?Sized> DynStack<T> {
     /// or explicitly call `std::mem::forget` on `item` after pushing.
     ///
     /// It is highly recommended to use the `dyn_push` macro instead of calling this directly.
-    pub unsafe fn push(&mut self, item: *mut T) {
+    #[inline(always)]
+    pub unsafe fn push_unchecked(&mut self, item: *mut T) -> *const T {
         let size = mem::size_of_val(&*item);
         let align = mem::align_of_val(&*item);
 
         debug_assert!(!self.dyn_data.is_null());
-
-        let align_offs = loop {
-            let curr_ptr = self.dyn_data as usize + self.dyn_size;
-            let aligned_ptr = align_up(curr_ptr, align);
-            let align_offs = aligned_ptr - curr_ptr;
-
-            if self.dyn_size + align_offs + size > self.dyn_cap {
-                self.grow();
-            } else {
-                break align_offs;
-            }
-        };
+        let curr_ptr = self.dyn_data as usize + self.dyn_size;
+        let aligned_ptr = align_up(curr_ptr, align);
+        let align_offs = aligned_ptr - curr_ptr;
+        debug_assert!(self.dyn_size + align_offs + size <= self.dyn_cap);
 
         self.dyn_data
             .add(self.dyn_size)
@@ -231,15 +227,19 @@ impl<T: ?Sized> DynStack<T> {
 
         let ptr_components = fatptr::decomp(item);
         debug_assert!(self.offs_table.len() + 1 <= self.offs_table.capacity());
-        ptr::write(self.offs_table.as_mut_ptr().add(self.offs_table.len()), (self.dyn_size + align_offs, ptr_components[1]));
+        let (rel_ptr, extdata) = (self.dyn_size + align_offs, *ptr_components.get_unchecked(1));
+        ptr::write(self.offs_table.as_mut_ptr().add(self.offs_table.len()), (rel_ptr, extdata));
         self.offs_table.set_len(self.offs_table.len() + 1);
 
         self.dyn_size += align_offs + size;
         self.max_align = align.max(self.max_align);
+
+        &*fatptr::recomp([self.dyn_data as usize + rel_ptr, extdata])
     }
 
     /// Remove the last trait object from the stack.
     /// Returns true if any items were removed.
+    #[inline(always)]
     pub fn remove_last(&mut self) -> bool {
         if let Some(last_item) = self.peek_mut() {
             unsafe { ptr::drop_in_place(last_item) };
@@ -252,6 +252,7 @@ impl<T: ?Sized> DynStack<T> {
     }
 
     /// Retrieve a trait object reference at the provided index.
+    #[inline(always)]
     pub fn get<'a>(&'a self, index: usize) -> Option<&'a T> {
         let item = self.offs_table.get(index)?;
         let components = [self.dyn_data as usize + item.0, item.1];
@@ -260,6 +261,7 @@ impl<T: ?Sized> DynStack<T> {
     }
 
     /// Retrieve a trait object reference at the provided index.
+    #[inline(always)]
     pub fn get_unchecked<'a>(&'a self, index: usize) -> &'a T {
         let item = unsafe { self.offs_table.get_unchecked(index) };
         let components = [self.dyn_data as usize + item.0, item.1];
@@ -267,6 +269,7 @@ impl<T: ?Sized> DynStack<T> {
     }
 
     /// Retrieve a mutable trait object reference at the provided index.
+    #[inline(always)]
     pub fn get_mut<'a>(&'a mut self, index: usize) -> Option<&'a mut T> {
         let item = self.offs_table.get(index)?;
         let components = [self.dyn_data as usize + item.0, item.1];
@@ -275,17 +278,20 @@ impl<T: ?Sized> DynStack<T> {
     }
 
     /// Retrieve the trait object reference at the top of the stack.
+    #[inline(always)]
     pub fn peek<'a>(&'a self) -> Option<&'a T> {
         self.get(self.len().wrapping_sub(1))
     }
 
     /// Retrieve the mutable trait object reference at the top of the stack.
+    #[inline(always)]
     pub fn peek_mut<'a>(&'a mut self) -> Option<&'a mut T> {
         let index = self.len().wrapping_sub(1);
         self.get_mut(index)
     }
 
     /// Returns the number of trait objects stored on the stack.
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.offs_table.len()
     }
@@ -349,29 +355,40 @@ impl<T: ?Sized> Drop for DynStack<T> {
     }
 }
 
+#[macro_export]
+macro_rules! dyn_push_ignore {
+    { $stack:expr, $item:expr } => {{
+        let mut t = $item;
+
+        unsafe { $stack.push_unchecked(&mut t) };
+        core::mem::forget(t);
+    }}
+}
+
 /// Push an item onto the back of the specified stack
 #[macro_export]
 macro_rules! dyn_push {
     { $stack:expr, $item:expr } => {{
         let mut t = $item;
 
-        unsafe { $stack.push(&mut t) };
+        let ptr = unsafe { $stack.push_unchecked(&mut t) };
         core::mem::forget(t);
+        ptr
     }}
 }
 
 #[test]
 fn test_push_pop() {
     use std::fmt::Debug;
-    let mut stack = DynStack::<dyn Debug>::with_capacity(10);
+    let mut stack = DynStack::<dyn Debug>::with_capacity(1 << 8);
     let bunch = vec![1u32, 2, 3, 4, 5, 6, 7, 8, 9];
-    dyn_push!(stack, 1u8);
-    dyn_push!(stack, 1u32);
-    dyn_push!(stack, 1u16);
-    dyn_push!(stack, 1u64);
-    dyn_push!(stack, 1u128);
-    dyn_push!(stack, bunch);
-    dyn_push!(stack, {
+    dyn_push_ignore!(stack, 1u8);
+    dyn_push_ignore!(stack, 1u32);
+    dyn_push_ignore!(stack, 1u16);
+    dyn_push_ignore!(stack, 1u64);
+    dyn_push_ignore!(stack, 1u128);
+    dyn_push_ignore!(stack, bunch);
+    dyn_push_ignore!(stack, {
         #[derive(Debug)]
         struct ZST;
         ZST
@@ -407,9 +424,9 @@ fn test_push_pop() {
 
 #[test]
 fn test_fn() {
-    let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(100);
+    let mut stack = DynStack::<dyn Fn() -> usize>::with_elements_capacity(100, 1 << 10);
     for i in 0..100 {
-        dyn_push!(stack, move || i);
+        dyn_push_ignore!(stack, move || i);
     }
 
     let mut item2 = 0;
@@ -443,13 +460,13 @@ fn test_drop() {
     }
 
     {
-        let mut stack = DynStack::<dyn Any>::with_capacity(10);
-        dyn_push!(stack, Droppable { counter: 1 });
-        dyn_push!(stack, Droppable { counter: 2 });
-        dyn_push!(stack, Droppable { counter: 3 });
-        dyn_push!(stack, Droppable { counter: 4 });
-        dyn_push!(stack, Droppable { counter: 5 });
-        dyn_push!(stack, Droppable { counter: 6 });
+        let mut stack = DynStack::<dyn Any>::with_elements_capacity(6, 1 << 8);
+        dyn_push_ignore!(stack, Droppable { counter: 1 });
+        dyn_push_ignore!(stack, Droppable { counter: 2 });
+        dyn_push_ignore!(stack, Droppable { counter: 3 });
+        dyn_push_ignore!(stack, Droppable { counter: 4 });
+        dyn_push_ignore!(stack, Droppable { counter: 5 });
+        dyn_push_ignore!(stack, Droppable { counter: 6 });
         assert!(drop_num().is_empty());
     }
 
@@ -518,19 +535,19 @@ fn test_align() {
         assert!(thin_ptr & (item.alignment() - 1) == 0);
     };
 
-    let mut stack = DynStack::<dyn Aligned>::with_capacity(256);
+    let mut stack = DynStack::<dyn Aligned>::with_capacity(1 << 16);
 
-    dyn_push!(stack, new32());
-    dyn_push!(stack, new64());
+    dyn_push_ignore!(stack, new32());
+    dyn_push_ignore!(stack, new64());
     assert_aligned(stack.peek().unwrap());
 
     for i in 0..256usize {
         let randomized = (i.pow(7) % 13) % 4;
         match randomized {
-            0 => dyn_push!(stack, 0xF0B0D0E0u32),
-            1 => dyn_push!(stack, 0x01020304F0B0D0E0u64),
-            2 => dyn_push!(stack, new32()),
-            3 => dyn_push!(stack, new64()),
+            0 => dyn_push_ignore!(stack, 0xF0B0D0E0u32),
+            1 => dyn_push_ignore!(stack, 0x01020304F0B0D0E0u64),
+            2 => dyn_push_ignore!(stack, new32()),
+            3 => dyn_push_ignore!(stack, new64()),
             _ => unreachable!(),
         }
         assert_aligned(stack.peek().unwrap());
@@ -541,12 +558,12 @@ fn test_align() {
 fn test_send() {
     use std::{fmt::Display, sync::mpsc, thread};
 
-    let mut stack: DynStack<dyn Display + Send> = DynStack::with_capacity(1);
-    dyn_push!(stack, String::from("1"));
+    let mut stack: DynStack<dyn Display + Send> = DynStack::with_capacity(1 << 6);
+    dyn_push_ignore!(stack, String::from("1"));
 
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        dyn_push!(stack, String::from("2"));
+        dyn_push_ignore!(stack, String::from("2"));
         sender.send(stack).unwrap();
     });
     let stack = receiver.recv().unwrap();
@@ -592,12 +609,12 @@ fn test_sync() {
     // Create a stack with different type of atomic integers in it.
     // We use quite a lot of integers, so the thread execution later
     // is likely to interleave.
-    let mut stack: DynStack<dyn AtomicInt> = DynStack::with_capacity(10000);
+    let mut stack: DynStack<dyn AtomicInt> = DynStack::with_elements_capacity(10_000, 1 << 20);
     for i in 0..10_000 {
         if i % 2 == 0 {
-            dyn_push!(stack, AtomicI32::new(0));
+            dyn_push_ignore!(stack, AtomicI32::new(0));
         } else {
-            dyn_push!(stack, AtomicU64::new(0));
+            dyn_push_ignore!(stack, AtomicU64::new(0));
         }
     }
 
@@ -623,7 +640,7 @@ fn test_sync() {
 
 #[test]
 fn test_iter_size_hint() {
-    let mut stack = DynStack::<dyn Fn() -> usize>::with_capacity(1);
+    let mut stack = DynStack::<dyn Fn() -> usize>::with_elements_capacity(10, 1 << 8);
     {
         let (min, max) = stack.iter().size_hint();
         assert_eq!(min, 0);
@@ -638,7 +655,7 @@ fn test_iter_size_hint() {
     }
 
     for i in 0..10 {
-        dyn_push!(stack, move || i);
+        dyn_push_ignore!(stack, move || i);
     }
 
     {
